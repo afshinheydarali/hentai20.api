@@ -22,6 +22,7 @@ ALLOWED_IMAGE_HOSTS = {
 
 IMAGE_TIMEOUT = (5, 20)
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_ATTRS = ("data-src", "data-lazy-src", "data-original", "data-full", "src")
 
 
 def first_text(soup: BeautifulSoup, selector: str, default: str = "") -> str:
@@ -35,6 +36,74 @@ def first_attr(soup: BeautifulSoup, selector: str, attr: str, default: str = "")
         return default
     value = element.get(attr)
     return value if isinstance(value, str) else default
+
+
+def normalize_image_url(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    return value
+
+
+def image_from_srcset(srcset: Optional[str]) -> str:
+    if not srcset:
+        return ""
+    candidates = []
+    for part in srcset.split(","):
+        chunks = part.strip().split()
+        if chunks:
+            candidates.append(chunks[0])
+    return normalize_image_url(candidates[-1]) if candidates else ""
+
+
+def extract_panel_images(soup: BeautifulSoup) -> List[str]:
+    containers = [
+        ".entry-content.entry-content-single",
+        ".entry-content",
+        ".reading-content",
+        ".chapter-content",
+        ".post-body",
+        "article",
+        "body",
+    ]
+
+    seen = set()
+    images: List[str] = []
+
+    for selector in containers:
+        root = soup.select_one(selector)
+        if not root:
+            continue
+
+        for img in root.select("img"):
+            image_url = ""
+            for attr in IMAGE_ATTRS:
+                image_url = normalize_image_url(img.get(attr))
+                if image_url:
+                    break
+
+            if not image_url:
+                image_url = image_from_srcset(img.get("srcset") or img.get("data-srcset"))
+
+            if not image_url:
+                continue
+
+            lower_url = image_url.lower()
+            if lower_url.startswith("data:") or "placeholder" in lower_url or "blank" in lower_url:
+                continue
+
+            if image_url not in seen:
+                seen.add(image_url)
+                images.append(image_url)
+
+        if images:
+            break
+
+    return images
 
 
 def is_public_host(hostname: str) -> bool:
@@ -69,14 +138,11 @@ async def get_panels(chapter_id: str) -> Union[Dict[str, Any], int]:
         return CRASH
 
     soup: BeautifulSoup = get_soup(response)
-    panel_eles: List = soup.select('.alignnone')
     chapter_title: str = first_text(soup, '.entry-title')
     panels: List[Dict[str, str]] = []
 
-    for panel in panel_eles:
-        image_url = panel.get("src")
-        if image_url:
-            panels.append({"image_url": image_url})
+    for image_url in extract_panel_images(soup):
+        panels.append({"image_url": image_url})
 
     return {
         "chapter_id": chapter_id,
