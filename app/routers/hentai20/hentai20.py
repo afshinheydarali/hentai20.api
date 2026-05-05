@@ -1,7 +1,10 @@
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional, Tuple
 from urllib.parse import urlparse
 import ipaddress
 import socket
+import io
+import re
+import zipfile
 
 from bs4 import BeautifulSoup
 from app.handlers.api_handler import ApiHandler
@@ -14,6 +17,7 @@ ALLOWED_IMAGE_HOSTS = {
     "hentai20.io",
     "www.hentai20.io",
     "cdn.hentai20.io",
+    "img.hentai1.io",
     "i0.wp.com",
     "i1.wp.com",
     "i2.wp.com",
@@ -22,7 +26,15 @@ ALLOWED_IMAGE_HOSTS = {
 
 IMAGE_TIMEOUT = (5, 20)
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 250 * 1024 * 1024
 IMAGE_ATTRS = ("data-src", "data-lazy-src", "data-original", "data-full", "src")
+BLOCKED_IMAGE_PARTS = (
+    "readerarea.svg",
+    "/themes/",
+    "/assets/",
+    "/wp-includes/",
+    "/wp-admin/",
+)
 
 
 def first_text(soup: BeautifulSoup, selector: str, default: str = "") -> str:
@@ -36,6 +48,13 @@ def first_attr(soup: BeautifulSoup, selector: str, attr: str, default: str = "")
         return default
     value = element.get(attr)
     return value if isinstance(value, str) else default
+
+
+def safe_archive_name(value: str) -> str:
+    value = value.strip().strip("/") or "chapter"
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", value)
+    value = value.strip(".-_") or "chapter"
+    return value[:120]
 
 
 def normalize_image_url(value: Optional[str]) -> str:
@@ -58,6 +77,21 @@ def image_from_srcset(srcset: Optional[str]) -> str:
         if chunks:
             candidates.append(chunks[0])
     return normalize_image_url(candidates[-1]) if candidates else ""
+
+
+def is_real_panel_image(image_url: str) -> bool:
+    lower_url = image_url.lower()
+    if lower_url.startswith("data:"):
+        return False
+    if lower_url.endswith(".svg"):
+        return False
+    if "placeholder" in lower_url or "blank" in lower_url:
+        return False
+    if any(part in lower_url for part in BLOCKED_IMAGE_PARTS):
+        return False
+    parsed = urlparse(image_url)
+    path = parsed.path.lower()
+    return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
 
 
 def extract_panel_images(soup: BeautifulSoup) -> List[str]:
@@ -89,11 +123,7 @@ def extract_panel_images(soup: BeautifulSoup) -> List[str]:
             if not image_url:
                 image_url = image_from_srcset(img.get("srcset") or img.get("data-srcset"))
 
-            if not image_url:
-                continue
-
-            lower_url = image_url.lower()
-            if lower_url.startswith("data:") or "placeholder" in lower_url or "blank" in lower_url:
+            if not image_url or not is_real_panel_image(image_url):
                 continue
 
             if image_url not in seen:
@@ -149,6 +179,42 @@ async def get_panels(chapter_id: str) -> Union[Dict[str, Any], int]:
         "chapter_title": chapter_title,
         "panels": panels,
     }
+
+
+async def build_chapter_zip(chapter_id: str) -> Union[Tuple[str, bytes], int]:
+    panel_data = await get_panels(chapter_id)
+    if panel_data == CRASH or type(panel_data) is int:
+        return CRASH
+
+    panels = panel_data.get("panels", [])
+    if not panels:
+        return CRASH
+
+    archive_name = safe_archive_name(panel_data.get("chapter_title") or chapter_id)
+    buffer = io.BytesIO()
+    total_size = 0
+
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, panel in enumerate(panels, start=1):
+            image_url = panel.get("image_url", "")
+            image_bytes = download_image_from_url(image_url)
+            if not image_bytes:
+                continue
+
+            total_size += len(image_bytes)
+            if total_size > MAX_ARCHIVE_BYTES:
+                return CRASH
+
+            suffix = urlparse(image_url).path.rsplit(".", 1)[-1].lower()
+            if suffix not in {"jpg", "jpeg", "png", "webp", "gif"}:
+                suffix = "jpg"
+            archive.writestr(f"{index:03d}.{suffix}", image_bytes)
+
+    archive_bytes = buffer.getvalue()
+    if not archive_bytes:
+        return CRASH
+
+    return f"{archive_name}.zip", archive_bytes
 
 
 async def get_manga(manga_id) -> Union[Dict[str, Any], int]:
