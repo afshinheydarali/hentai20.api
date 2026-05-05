@@ -16,4 +16,4 @@ RUN python -m pip install --upgrade pip \
 
 COPY . .
 
-CMD ["python", "-u", "bot.py"]
+CMD ["python", "-u", "bot_paginated.py"]
