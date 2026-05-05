@@ -1,5 +1,6 @@
 import re
 from typing import Any, Dict, Optional, Union
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -9,7 +10,8 @@ from app.routers.hentai20.hentai20 import (
      get_panels,
      get_manga,
      download_image_from_url,
-     get_filter_mangas
+     get_filter_mangas,
+     build_chapter_zip,
 )
 
 router: APIRouter = APIRouter(prefix="/hentai")
@@ -87,6 +89,27 @@ async def read(chapter_id: str) -> JSONResponse:
           return response.bad_request_response()
 
      return response.successful_response({"data": data})
+
+
+@router.get("/download/{chapter_id:path}")
+async def download_chapter(chapter_id: str) -> Response:
+     if not is_valid_slug(chapter_id):
+          raise HTTPException(status_code=400, detail="Invalid chapter_id")
+
+     result = await build_chapter_zip(chapter_id=chapter_id)
+     if result == CRASH or type(result) is int:
+          raise HTTPException(status_code=400, detail="Could not build chapter archive")
+
+     filename, archive_bytes = result
+     safe_header_name = quote(filename)
+     return Response(
+          content=archive_bytes,
+          media_type="application/zip",
+          headers={
+               "Content-Disposition": f"attachment; filename*=UTF-8''{safe_header_name}",
+               "Content-Length": str(len(archive_bytes)),
+          },
+     )
 
 
 @router.get("/{manga_id}")
