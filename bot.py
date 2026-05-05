@@ -36,6 +36,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 DEFAULT_PAGE = int(os.getenv("DEFAULT_PAGE", "1") or "1")
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "10") or "10")
 MAX_CHAPTERS_PER_ALL = int(os.getenv("MAX_CHAPTERS_PER_ALL", "10") or "10")
+MAX_CHAPTER_BUTTONS = int(os.getenv("MAX_CHAPTER_BUTTONS", "80") or "80")
 
 BASE_URL = "https://hentai20.io"
 
@@ -238,10 +239,13 @@ async def send_zip(update: Update, chapter_id: str, title: str) -> None:
 def manga_keyboard(slug: str, chapters: List[Dict[str, str]]) -> InlineKeyboardMarkup:
     rows = []
 
-    for chapter in chapters[:20]:
+    for chapter in chapters[:MAX_CHAPTER_BUTTONS]:
         chapter_id = chapter.get("chapter_id", "")
         name = chapter.get("name", chapter_id)
         rows.append([InlineKeyboardButton(name, callback_data=f"chapter:{chapter_id}")])
+
+    if len(chapters) > MAX_CHAPTER_BUTTONS:
+        rows.append([InlineKeyboardButton(f"Only showing first {MAX_CHAPTER_BUTTONS} chapters", callback_data="noop")])
 
     rows.append([InlineKeyboardButton("Download first chapters", callback_data=f"all:{slug}")])
     return InlineKeyboardMarkup(rows)
@@ -368,6 +372,7 @@ async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Op
     lines = [
         f"Title: {info.get('title', slug)}",
         f"Score: {info.get('score', '-')}",
+        f"Chapters: {len(chapters)}",
         "",
         "Select a chapter:",
     ]
@@ -455,6 +460,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data or ""
+
+    if data == "noop":
+        return
 
     if data.startswith("manga:"):
         slug = data.removeprefix("manga:")
