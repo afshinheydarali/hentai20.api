@@ -28,6 +28,7 @@ IMAGE_HEADERS = {
 
 MAX_IMAGE_BYTES = 80 * 1024 * 1024
 REQUEST_TIMEOUT = (8, 60)
+IMAGE_EXTENSIONS = ["jpg", "png", "webp", "gif", "jpeg"]
 
 BLOCKED_TERMS = {
     "underage", "minor", "child", "children", "kid", "kids", "loli", "lolicon",
@@ -137,7 +138,6 @@ def search_nhentai(query: str, limit: int = 10) -> List[NHResult]:
 
 
 def _extract_gallery_json(html: str) -> Optional[Dict[str, Any]]:
-    # Common nhentai layout contains a JSON blob with media_id and images.pages.
     patterns = [
         r"window\._gallery\s*=\s*JSON\.parse\((?P<json>\".*?\")\)",
         r"new N.gallery\((?P<json>\{.*?\})\)",
@@ -178,9 +178,7 @@ def _pages_from_thumbnails(soup: BeautifulSoup) -> tuple[Optional[str], List[str
             continue
         media_id = media_id or match.group(1)
         ext = match.group(3).lower()
-        if ext == "webp":
-            ext = "jpg"
-        pages.append(ext)
+        pages.append(ext if ext in IMAGE_EXTENSIONS else "jpg")
 
     return media_id, pages
 
@@ -223,29 +221,29 @@ def _image_url(gallery: NHGallery, index: int, ext: str) -> str:
     return f"{NH_IMAGE_HOST}/galleries/{gallery.media_id}/{index}.{ext}"
 
 
-def build_nhentai_zip(gallery_id_or_url: str) -> tuple[str, bytes, str]:
-    gallery_id = extract_nhentai_id(gallery_id_or_url) or gallery_id_or_url
-    gallery = get_nhentai_gallery(gallery_id)
+def _candidate_extensions(preferred: str) -> List[str]:
+    preferred = (preferred or "jpg").lower()
+    candidates = [preferred]
+    candidates.extend(ext for ext in IMAGE_EXTENSIONS if ext != preferred)
+    return candidates
 
-    archive = io.BytesIO()
-    safe_title = _safe_filename(gallery.title)
 
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("metadata.txt", f"Source: nhentai\nID: {gallery.id}\nTitle: {gallery.title}\nURL: {gallery.url}\n")
+def _download_image_with_fallback(gallery: NHGallery, index: int, preferred_ext: str) -> tuple[str, bytes]:
+    last_error: Optional[Exception] = None
 
-        for index, ext in enumerate(gallery.pages, start=1):
-            url = _image_url(gallery, index, ext)
+    for ext in _candidate_extensions(preferred_ext):
+        url = _image_url(gallery, index, ext)
+        try:
             response = requests.get(url, headers=IMAGE_HEADERS, timeout=REQUEST_TIMEOUT, stream=True)
-            if response.status_code == 404 and ext != "jpg":
+            if response.status_code == 404:
                 response.close()
-                url = _image_url(gallery, index, "jpg")
-                response = requests.get(url, headers=IMAGE_HEADERS, timeout=REQUEST_TIMEOUT, stream=True)
+                continue
             response.raise_for_status()
 
             content_type = response.headers.get("Content-Type", "").lower()
             if content_type and "image" not in content_type:
                 response.close()
-                raise RuntimeError(f"Unexpected non-image response for page {index}")
+                continue
 
             data = bytearray()
             for chunk in response.iter_content(chunk_size=64 * 1024):
@@ -257,7 +255,35 @@ def build_nhentai_zip(gallery_id_or_url: str) -> tuple[str, bytes, str]:
                     raise RuntimeError(f"Image page {index} is too large")
             response.close()
 
-            zf.writestr(f"{index:03}.{ext}", bytes(data))
+            if not data:
+                continue
+            return ext, bytes(data)
+        except Exception as exc:
+            last_error = exc
+            try:
+                response.close()
+            except Exception:
+                pass
+            continue
+
+    if last_error:
+        raise RuntimeError(f"Could not download nhentai page {index}: {last_error}")
+    raise RuntimeError(f"Could not download nhentai page {index}: no extension matched")
+
+
+def build_nhentai_zip(gallery_id_or_url: str) -> tuple[str, bytes, str]:
+    gallery_id = extract_nhentai_id(gallery_id_or_url) or gallery_id_or_url
+    gallery = get_nhentai_gallery(gallery_id)
+
+    archive = io.BytesIO()
+    safe_title = _safe_filename(gallery.title)
+
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("metadata.txt", f"Source: nhentai\nID: {gallery.id}\nTitle: {gallery.title}\nURL: {gallery.url}\n")
+
+        for index, preferred_ext in enumerate(gallery.pages, start=1):
+            ext, data = _download_image_with_fallback(gallery, index, preferred_ext)
+            zf.writestr(f"{index:03}.{ext}", data)
             time.sleep(0.2)
 
     return f"nhentai-{gallery.id}-{safe_title}.zip", archive.getvalue(), gallery.title
