@@ -31,6 +31,7 @@ MAX_TELEGRAM_FILE_BYTES = MAX_TELEGRAM_FILE_MB * 1024 * 1024
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "10") or "10")
 MAX_CHAPTERS_PER_ALL = int(os.getenv("MAX_CHAPTERS_PER_ALL", "10") or "10")
 CHAPTERS_PER_PAGE = int(os.getenv("CHAPTERS_PER_PAGE", "20") or "20")
+MAX_CALLBACK_CACHE = int(os.getenv("MAX_CALLBACK_CACHE", "1000") or "1000")
 H20_BASE_URL = os.getenv("H20_BASE_URL", "https://hentai20.io").rstrip("/")
 
 CHAPTER_RE = re.compile(r"([a-zA-Z0-9][a-zA-Z0-9_-]*-chapter-[a-zA-Z0-9._-]+)/?")
@@ -55,6 +56,27 @@ def blocked_text(*values: str) -> bool:
 
 def valid_slug(value: str) -> bool:
     return bool(value and SLUG_RE.fullmatch(value)) and ".." not in value
+
+
+def put_cb(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: str) -> str:
+    """Store long callback payloads server-side and return a short Telegram-safe token.
+
+    Telegram callback_data must be 1-64 bytes. Manga slugs and chapter IDs can exceed
+    that, so every Hentai20 button uses a tiny token like m12, c13, p14 instead.
+    """
+    cache = context.user_data.setdefault("cb_payloads", {})
+    seq = int(context.user_data.get("cb_seq", 0)) + 1
+    if len(cache) > MAX_CALLBACK_CACHE:
+        cache.clear()
+    token = f"{kind}{seq}"
+    cache[token] = payload
+    context.user_data["cb_seq"] = seq
+    return token
+
+
+def get_cb(context: ContextTypes.DEFAULT_TYPE, token: str) -> Optional[str]:
+    payload = context.user_data.get("cb_payloads", {}).get(token)
+    return payload if isinstance(payload, str) else None
 
 
 def parse_search_args(args: List[str]) -> tuple[str, str]:
@@ -149,17 +171,18 @@ async def build_h20_zip(chapter_id: str) -> tuple[Optional[str], Optional[bytes]
     return filename, archive_bytes, info.get("title", slug)
 
 
-def h20_search_keyboard(results: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def h20_search_keyboard(results: List[Dict[str, Any]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     rows = []
     for item in results:
         title = item.get("title") or item.get("slug")
         latest = item.get("latest_chapter", "")
         label = f"H20: {title[:42]} - {latest}" if latest else f"H20: {title[:55]}"
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"h20m:{item.get('slug')}")])
+        token = put_cb(context, "m", item.get("slug") or "")
+        rows.append([InlineKeyboardButton(label[:60], callback_data=token)])
     return InlineKeyboardMarkup(rows)
 
 
-def h20_manga_keyboard(slug: str, chapters: List[Dict[str, str]], page: int = 0) -> InlineKeyboardMarkup:
+def h20_manga_keyboard(slug: str, chapters: List[Dict[str, str]], context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> InlineKeyboardMarkup:
     total = len(chapters)
     per_page = max(1, CHAPTERS_PER_PAGE)
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -168,22 +191,22 @@ def h20_manga_keyboard(slug: str, chapters: List[Dict[str, str]], page: int = 0)
     for chapter in chapters[page * per_page:(page + 1) * per_page]:
         cid = chapter.get("chapter_id", "")
         name = chapter.get("name", cid)
-        rows.append([InlineKeyboardButton(name[:60], callback_data=f"h20c:{cid}")])
+        rows.append([InlineKeyboardButton(name[:60], callback_data=put_cb(context, "c", cid))])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("Previous", callback_data=f"h20p:{slug}:{page-1}"))
+        nav.append(InlineKeyboardButton("Previous", callback_data=put_cb(context, "p", f"{slug}|{page-1}")))
     nav.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next", callback_data=f"h20p:{slug}:{page+1}"))
+        nav.append(InlineKeyboardButton("Next", callback_data=put_cb(context, "p", f"{slug}|{page+1}")))
     rows.append(nav)
-    rows.append([InlineKeyboardButton("Download first chapters", callback_data=f"h20all:{slug}")])
+    rows.append([InlineKeyboardButton("Download first chapters", callback_data=put_cb(context, "a", slug))])
     return InlineKeyboardMarkup(rows)
 
 
-def h20_destination_keyboard(chapter_id: str) -> InlineKeyboardMarkup:
+def h20_destination_keyboard(chapter_id: str, context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Send ZIP in Telegram", callback_data=f"h20tg:{chapter_id}")],
-        [InlineKeyboardButton("Upload ZIP to Google Drive", callback_data=f"h20gd:{chapter_id}")],
+        [InlineKeyboardButton("Send ZIP in Telegram", callback_data=put_cb(context, "t", chapter_id))],
+        [InlineKeyboardButton("Upload ZIP to Google Drive", callback_data=put_cb(context, "g", chapter_id))],
     ])
 
 
@@ -219,11 +242,11 @@ def eh_search_keyboard(results: List[Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def mixed_keyboard(h20_results: List[Dict[str, Any]], eh_results: List[Any]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup((h20_search_keyboard(h20_results).inline_keyboard + eh_search_keyboard(eh_results).inline_keyboard)[:20])
+def mixed_keyboard(h20_results: List[Dict[str, Any]], eh_results: List[Any], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup((h20_search_keyboard(h20_results, context).inline_keyboard + eh_search_keyboard(eh_results).inline_keyboard)[:20])
 
 
-async def show_h20_manga(update: Update, slug: str, page: int = 0, edit: bool = False) -> None:
+async def show_h20_manga(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: str, page: int = 0, edit: bool = False) -> None:
     target = update.callback_query.message if update.callback_query else update.effective_message
     info, err = await get_safe_h20_manga(slug)
     if err or not info:
@@ -240,14 +263,14 @@ async def show_h20_manga(update: Update, slug: str, page: int = 0, edit: bool = 
         "",
         "Select a chapter:",
     ])
-    markup = h20_manga_keyboard(slug, chapters, page)
+    markup = h20_manga_keyboard(slug, chapters, context, page)
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=markup)
     else:
         await target.reply_text(text, reply_markup=markup)
 
 
-async def ask_h20_destination(update: Update, chapter_id: str) -> None:
+async def ask_h20_destination(update: Update, context: ContextTypes.DEFAULT_TYPE, chapter_id: str) -> None:
     slug = manga_slug_from_chapter_id(chapter_id)
     info, err = await get_safe_h20_manga(slug)
     if err or not info:
@@ -255,7 +278,7 @@ async def ask_h20_destination(update: Update, chapter_id: str) -> None:
         return
     await update.effective_message.reply_text(
         f"Hentai20 chapter selected:\n{info.get('title', slug)}\n{chapter_id}\n\nChoose output:",
-        reply_markup=h20_destination_keyboard(chapter_id),
+        reply_markup=h20_destination_keyboard(chapter_id, context),
     )
 
 
@@ -379,7 +402,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for i, item in enumerate(eh_results, 1):
         if not blocked_text(item.title, item.category, item.url):
             lines.append(f"EH {i}. {item.title} | {item.category}")
-    markup = h20_search_keyboard(h20_results) if source == "hentai20" else eh_search_keyboard(eh_results) if source == "ehentai" else mixed_keyboard(h20_results, eh_results)
+    markup = h20_search_keyboard(h20_results, context) if source == "hentai20" else eh_search_keyboard(eh_results) if source == "ehentai" else mixed_keyboard(h20_results, eh_results, context)
     await update.message.reply_text("\n".join(lines[:25]), reply_markup=markup)
 
 
@@ -410,7 +433,7 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not results:
         await update.message.reply_text("No results found.")
         return
-    await update.message.reply_text("Filter results:", reply_markup=h20_search_keyboard(results))
+    await update.message.reply_text("Filter results:", reply_markup=h20_search_keyboard(results, context))
 
 
 async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,7 +444,7 @@ async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not slug:
         await update.effective_message.reply_text("Usage: /manga manga-slug")
         return
-    await show_h20_manga(update, slug)
+    await show_h20_manga(update, context, slug)
 
 
 async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -432,7 +455,7 @@ async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if kind != "chapter" or not value:
         await update.message.reply_text("Usage: /chapter 69-university-chapter-35/")
         return
-    await ask_h20_destination(update, value)
+    await ask_h20_destination(update, context, value)
 
 
 async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Optional[str] = None) -> None:
@@ -464,19 +487,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = q.data or ""
     if data == "noop":
         return
-    if data.startswith("h20m:"):
-        await show_h20_manga(update, data.removeprefix("h20m:"))
-    elif data.startswith("h20p:"):
-        _, slug, page = data.split(":", 2)
-        await show_h20_manga(update, slug, int(page), edit=True)
-    elif data.startswith("h20c:"):
-        await ask_h20_destination(update, data.removeprefix("h20c:"))
-    elif data.startswith("h20tg:"):
-        await send_h20_tg(update, data.removeprefix("h20tg:"))
-    elif data.startswith("h20gd:"):
-        await send_h20_gd(update, data.removeprefix("h20gd:"))
-    elif data.startswith("h20all:"):
-        await all_cmd(update, context, data.removeprefix("h20all:"))
+    if data.startswith("m"):
+        slug = get_cb(context, data)
+        if not slug:
+            await q.message.reply_text("This button expired. Please search again.")
+            return
+        await show_h20_manga(update, context, slug)
+    elif data.startswith("p"):
+        payload = get_cb(context, data)
+        if not payload or "|" not in payload:
+            await q.message.reply_text("This button expired. Please open the manga again.")
+            return
+        slug, page = payload.rsplit("|", 1)
+        await show_h20_manga(update, context, slug, int(page), edit=True)
+    elif data.startswith("c"):
+        chapter_id = get_cb(context, data)
+        if not chapter_id:
+            await q.message.reply_text("This button expired. Please open the manga again.")
+            return
+        await ask_h20_destination(update, context, chapter_id)
+    elif data.startswith("t"):
+        chapter_id = get_cb(context, data)
+        if not chapter_id:
+            await q.message.reply_text("This button expired. Please open the manga again.")
+            return
+        await send_h20_tg(update, chapter_id)
+    elif data.startswith("g"):
+        chapter_id = get_cb(context, data)
+        if not chapter_id:
+            await q.message.reply_text("This button expired. Please open the manga again.")
+            return
+        await send_h20_gd(update, chapter_id)
+    elif data.startswith("a"):
+        slug = get_cb(context, data)
+        if not slug:
+            await q.message.reply_text("This button expired. Please open the manga again.")
+            return
+        await all_cmd(update, context, slug)
     elif data.startswith("eh:"):
         gallery_url = eh_url_from_callback(data)
         if gallery_url:
@@ -499,9 +546,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     kind, value = extract_h20_target(text)
     if kind == "chapter" and value:
-        await ask_h20_destination(update, value)
+        await ask_h20_destination(update, context, value)
     elif kind == "manga" and value:
-        await show_h20_manga(update, value)
+        await show_h20_manga(update, context, value)
     else:
         context.args = text.split()
         await search_cmd(update, context)
