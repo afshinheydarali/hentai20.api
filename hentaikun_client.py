@@ -4,7 +4,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -65,7 +65,27 @@ def _safe_filename(name: str) -> str:
 
 
 def _clean_url(value: str) -> str:
-    return re.sub(r"\s+", "", value or "").strip()
+    """Trim wrapping whitespace and URL-encode path spaces without removing them.
+
+    HentaiKun image URLs can contain real spaces, for example:
+    https://s1.hendata.com/images/eng/M/Mother swap - your mother belongs to me 1/001.jpg
+
+    Removing whitespace breaks the URL. The correct request URL must percent-encode the
+    path as Mother%20swap%20-%20your%20mother%20belongs%20to%20me%201/001.jpg.
+    """
+    raw = (value or "").strip()
+    # Remove only accidental line-break characters around/in copied HTML attributes, not normal spaces.
+    raw = re.sub(r"[\r\n\t]+", "", raw).strip()
+    if not raw:
+        return ""
+
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        encoded_path = quote(parsed.path, safe="/%")
+        encoded_query = quote(parsed.query, safe="=&?/%:+,%")
+        return urlunparse((parsed.scheme, parsed.netloc, encoded_path, parsed.params, encoded_query, parsed.fragment))
+
+    return raw
 
 
 def extract_hentaikun_url(text: str) -> Optional[str]:
@@ -85,8 +105,6 @@ def extract_hentaikun_url(text: str) -> Optional[str]:
     if len(parts) < 3:
         return None
 
-    # Normalize album/chapter/page URLs back to the album URL:
-    # /manga/<category>/<album>/chapter-1/2/ -> /manga/<category>/<album>/
     return f"https://{HK_DOMAIN}/" + "/".join(parts[:3]) + "/"
 
 
@@ -140,13 +158,12 @@ def _extract_page_image_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
                     _add_unique(urls, seen, value, base_url)
                     break
 
-    # Current HentaiKun pages also expose upcoming pages inside preloadImages([...]).
-    # Capture those URLs as a useful fallback and to avoid fetching every numbered page when possible.
     for script in soup.find_all("script"):
         text = script.string or script.get_text(" ", strip=False) or ""
         if "preloadImages" not in text and "hendata.com" not in text:
             continue
-        for match in re.findall(r"https?://[^'\"\s,]+\.(?:jpg|jpeg|png|webp|gif)", text, flags=re.I):
+        # Capture quoted URLs, including URLs containing spaces.
+        for match in re.findall(r"['\"](https?://[^'\"]+?\.(?:jpg|jpeg|png|webp|gif))['\"]", text, flags=re.I):
             _add_unique(urls, seen, match, base_url)
 
     return urls
@@ -192,7 +209,6 @@ def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
             seen_chapters.add(href)
             chapter_links.append(href)
 
-    # If the album page uses a chapter dropdown instead of a.readchap, support it too.
     for href in _extract_option_urls(soup, normalized):
         if "/chapter-" in href and href not in seen_chapters:
             seen_chapters.add(href)
@@ -212,7 +228,6 @@ def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
         page_urls: List[str] = []
         seen_pages: set[str] = set()
         for href in _extract_option_urls(chapter_soup, chapter_url):
-            # Keep only page URLs for this chapter, not links to other chapters.
             if "/chapter-" not in href:
                 continue
             if href not in seen_pages:
@@ -222,7 +237,6 @@ def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
         if not page_urls:
             page_urls = [chapter_url]
 
-        # Fetch all page URLs from the dropdown. If missing, follow Next links as a fallback.
         for page_url in page_urls:
             page_res = _get(page_url)
             page_soup = BeautifulSoup(page_res.text, "html.parser")
