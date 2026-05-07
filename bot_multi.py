@@ -21,6 +21,7 @@ from ehentai_client import (
     search_galleries,
 )
 from gdrive_uploader import upload_chapter_zip
+from nhentai_client import build_nhentai_zip, extract_nhentai_id, search_nhentai
 
 load_dotenv()
 
@@ -36,7 +37,17 @@ H20_BASE_URL = os.getenv("H20_BASE_URL", "https://hentai20.io").rstrip("/")
 
 CHAPTER_RE = re.compile(r"([a-zA-Z0-9][a-zA-Z0-9_-]*-chapter-[a-zA-Z0-9._-]+)/?")
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_./-]{0,180}$")
-SOURCE_ALIASES = {"hentai20": "hentai20", "h20": "hentai20", "ehentai": "ehentai", "eh": "ehentai", "both": "both", "all": "both"}
+SOURCE_ALIASES = {
+    "hentai20": "hentai20",
+    "h20": "hentai20",
+    "ehentai": "ehentai",
+    "eh": "ehentai",
+    "nhentai": "nhentai",
+    "nh": "nhentai",
+    "n": "nhentai",
+    "both": "all",
+    "all": "all",
+}
 BLOCKED_TERMS = {
     "underage", "minor", "child", "children", "kid", "kids", "loli", "shota",
     "junior high", "middle school", "elementary", "schoolgirl", "schoolboy",
@@ -59,11 +70,7 @@ def valid_slug(value: str) -> bool:
 
 
 def put_cb(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: str) -> str:
-    """Store long callback payloads server-side and return a short Telegram-safe token.
-
-    Telegram callback_data must be 1-64 bytes. Manga slugs and chapter IDs can exceed
-    that, so every Hentai20 button uses a tiny token like m12, c13, p14 instead.
-    """
+    """Store long callback payloads server-side and return a short Telegram-safe token."""
     cache = context.user_data.setdefault("cb_payloads", {})
     seq = int(context.user_data.get("cb_seq", 0)) + 1
     if len(cache) > MAX_CALLBACK_CACHE:
@@ -177,8 +184,7 @@ def h20_search_keyboard(results: List[Dict[str, Any]], context: ContextTypes.DEF
         title = item.get("title") or item.get("slug")
         latest = item.get("latest_chapter", "")
         label = f"H20: {title[:42]} - {latest}" if latest else f"H20: {title[:55]}"
-        token = put_cb(context, "m", item.get("slug") or "")
-        rows.append([InlineKeyboardButton(label[:60], callback_data=token)])
+        rows.append([InlineKeyboardButton(label[:60], callback_data=put_cb(context, "m", item.get("slug") or ""))])
     return InlineKeyboardMarkup(rows)
 
 
@@ -242,8 +248,27 @@ def eh_search_keyboard(results: List[Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def mixed_keyboard(h20_results: List[Dict[str, Any]], eh_results: List[Any], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup((h20_search_keyboard(h20_results, context).inline_keyboard + eh_search_keyboard(eh_results).inline_keyboard)[:20])
+def nh_search_keyboard(results: List[Any], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    rows = []
+    for item in results:
+        if blocked_text(item.title, item.url, item.id):
+            continue
+        rows.append([InlineKeyboardButton(("NH: " + item.title)[:60], callback_data=put_cb(context, "n", item.id))])
+    return InlineKeyboardMarkup(rows)
+
+
+def nh_destination_keyboard(gallery_id: str, context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Send ZIP in Telegram", callback_data=put_cb(context, "u", gallery_id))],
+        [InlineKeyboardButton("Upload ZIP to Google Drive", callback_data=put_cb(context, "v", gallery_id))],
+    ])
+
+
+def mixed_keyboard(h20_results: List[Dict[str, Any]], eh_results: List[Any], nh_results: List[Any], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    rows = h20_search_keyboard(h20_results, context).inline_keyboard
+    rows += eh_search_keyboard(eh_results).inline_keyboard
+    rows += nh_search_keyboard(nh_results, context).inline_keyboard
+    return InlineKeyboardMarkup(rows[:20])
 
 
 async def show_h20_manga(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: str, page: int = 0, edit: bool = False) -> None:
@@ -294,6 +319,13 @@ async def ask_eh_destination(update: Update, gallery_url: str) -> None:
     await update.effective_message.reply_text(
         f"EHentai gallery selected:\n{title}\n{gallery_url}\n\nChoose output:",
         reply_markup=eh_destination_keyboard(gallery_url),
+    )
+
+
+async def ask_nh_destination(update: Update, context: ContextTypes.DEFAULT_TYPE, gallery_id: str) -> None:
+    await update.effective_message.reply_text(
+        f"nhentai gallery selected:\n{gallery_id}\n\nChoose output:",
+        reply_markup=nh_destination_keyboard(gallery_id, context),
     )
 
 
@@ -357,6 +389,33 @@ async def send_eh_gd(update: Update, gallery_url: str) -> None:
     await status.edit_text(f"Uploaded to Google Drive:\n{link}")
 
 
+async def send_nh_tg(update: Update, gallery_id: str) -> None:
+    status = await update.effective_message.reply_text(f"Building nhentai ZIP for {gallery_id} ...")
+    try:
+        filename, data, title = build_nhentai_zip(gallery_id)
+    except Exception as exc:
+        await status.edit_text(f"Could not build nhentai ZIP: {type(exc).__name__}: {exc}")
+        return
+    if blocked_text(title, filename, gallery_id):
+        await status.edit_text("Blocked: this gallery appears to involve minors or unsafe terms.")
+        return
+    await send_bytes_telegram(update, filename, data, f"{title}\nnhentai #{gallery_id}", status)
+
+
+async def send_nh_gd(update: Update, gallery_id: str) -> None:
+    status = await update.effective_message.reply_text(f"Building nhentai ZIP and uploading to Google Drive for {gallery_id} ...")
+    try:
+        filename, data, title = build_nhentai_zip(gallery_id)
+        if blocked_text(title, filename, gallery_id):
+            await status.edit_text("Blocked: this gallery appears to involve minors or unsafe terms.")
+            return
+        link = upload_chapter_zip(data, filename, title)
+    except Exception as exc:
+        await status.edit_text(f"nhentai Google Drive upload failed: {type(exc).__name__}: {exc}")
+        return
+    await status.edit_text(f"Uploaded to Google Drive:\n{link}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         await update.message.reply_text("Access denied.")
@@ -365,12 +424,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "/search name hentai20\n"
         "/search name ehentai\n"
-        "/search name both\n"
+        "/search name nhentai\n"
+        "/search name all\n"
         "/filter page=1 sort=latest type=manhwa status=completed genre=...\n"
         "/manga manga-slug\n"
         "/chapter chapter-id\n"
         "/all manga-slug\n\n"
-        "Direct links from hentai20 and EHentai are detected automatically."
+        "Direct links from hentai20, EHentai and nhentai are detected automatically."
     )
 
 
@@ -380,20 +440,28 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     query, source = parse_search_args(context.args)
     if not query:
-        await update.message.reply_text("Usage: /search manga name hentai20|ehentai|both")
+        await update.message.reply_text("Usage: /search manga name hentai20|ehentai|nhentai|all")
         return
     h20_results: List[Dict[str, Any]] = []
     eh_results: List[Any] = []
-    if source in {"hentai20", "both"}:
+    nh_results: List[Any] = []
+    if source in {"hentai20", "all"}:
         h20_results = await search_h20(query)
-    if source in {"ehentai", "both"}:
+    if source in {"ehentai", "all"}:
         try:
             eh_results = search_galleries(query, DEFAULT_SEARCH_LIMIT)
         except Exception as exc:
             await update.message.reply_text(f"EHentai search failed: {type(exc).__name__}: {exc}")
             if source == "ehentai":
                 return
-    if not h20_results and not eh_results:
+    if source in {"nhentai", "all"}:
+        try:
+            nh_results = search_nhentai(query, DEFAULT_SEARCH_LIMIT)
+        except Exception as exc:
+            await update.message.reply_text(f"nhentai search failed: {type(exc).__name__}: {exc}")
+            if source == "nhentai":
+                return
+    if not h20_results and not eh_results and not nh_results:
         await update.message.reply_text("No results found.")
         return
     lines = [f"Search results: {source}"]
@@ -402,7 +470,17 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for i, item in enumerate(eh_results, 1):
         if not blocked_text(item.title, item.category, item.url):
             lines.append(f"EH {i}. {item.title} | {item.category}")
-    markup = h20_search_keyboard(h20_results, context) if source == "hentai20" else eh_search_keyboard(eh_results) if source == "ehentai" else mixed_keyboard(h20_results, eh_results, context)
+    for i, item in enumerate(nh_results, 1):
+        if not blocked_text(item.title, item.url, item.id):
+            lines.append(f"NH {i}. {item.title} | id: {item.id}")
+    if source == "hentai20":
+        markup = h20_search_keyboard(h20_results, context)
+    elif source == "ehentai":
+        markup = eh_search_keyboard(eh_results)
+    elif source == "nhentai":
+        markup = nh_search_keyboard(nh_results, context)
+    else:
+        markup = mixed_keyboard(h20_results, eh_results, nh_results, context)
     await update.message.reply_text("\n".join(lines[:25]), reply_markup=markup)
 
 
@@ -524,6 +602,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text("This button expired. Please open the manga again.")
             return
         await all_cmd(update, context, slug)
+    elif data.startswith("n"):
+        gallery_id = get_cb(context, data)
+        if not gallery_id:
+            await q.message.reply_text("This button expired. Please search again.")
+            return
+        await ask_nh_destination(update, context, gallery_id)
+    elif data.startswith("u"):
+        gallery_id = get_cb(context, data)
+        if not gallery_id:
+            await q.message.reply_text("This button expired. Please search again.")
+            return
+        await send_nh_tg(update, gallery_id)
+    elif data.startswith("v"):
+        gallery_id = get_cb(context, data)
+        if not gallery_id:
+            await q.message.reply_text("This button expired. Please search again.")
+            return
+        await send_nh_gd(update, gallery_id)
     elif data.startswith("eh:"):
         gallery_url = eh_url_from_callback(data)
         if gallery_url:
@@ -543,6 +639,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     eh_url = extract_gallery_url(text)
     if eh_url:
         await ask_eh_destination(update, eh_url)
+        return
+    nh_id = extract_nhentai_id(text)
+    if nh_id:
+        await ask_nh_destination(update, context, nh_id)
         return
     kind, value = extract_h20_target(text)
     if kind == "chapter" and value:
@@ -567,7 +667,7 @@ def main() -> None:
     app.add_handler(CommandHandler("all", all_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    print("Telegram bot with Hentai20, EHentai, and Google Drive support started.", flush=True)
+    print("Telegram bot with Hentai20, EHentai, nhentai, and Google Drive support started.", flush=True)
     app.run_polling()
 
 
