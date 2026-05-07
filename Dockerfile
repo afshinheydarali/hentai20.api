@@ -16,4 +16,4 @@ RUN python -m pip install --upgrade pip \
 
 COPY . .
 
-CMD ["python", "-u", "bot_gdrive.py"]
+CMD ["python", "-u", "bot_multi.py"]
