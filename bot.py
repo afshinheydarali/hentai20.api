@@ -37,6 +37,7 @@ DEFAULT_PAGE = int(os.getenv("DEFAULT_PAGE", "1") or "1")
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "10") or "10")
 MAX_CHAPTERS_PER_ALL = int(os.getenv("MAX_CHAPTERS_PER_ALL", "10") or "10")
 MAX_CHAPTER_BUTTONS = int(os.getenv("MAX_CHAPTER_BUTTONS", "80") or "80")
+MAX_CALLBACK_CACHE = int(os.getenv("MAX_CALLBACK_CACHE", "500") or "500")
 
 BASE_URL = "https://hentai20.io"
 
@@ -78,6 +79,30 @@ def valid_slug(value: str) -> bool:
 def blocked_text(*values: str) -> bool:
     text = "\n".join(v or "" for v in values).lower()
     return any(term in text for term in BLOCKED_TERMS)
+
+
+def add_callback_payload(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: str) -> str:
+    """Store long callback payloads server-side and return a short Telegram-safe key.
+
+    Telegram limits InlineKeyboardButton.callback_data to 64 bytes. Long manga slugs or
+    chapter IDs can exceed that, so buttons only carry short keys like m12/c13/a14.
+    """
+    cache = context.user_data.setdefault("callback_payloads", {})
+    seq = int(context.user_data.get("callback_seq", 0)) + 1
+
+    if len(cache) > MAX_CALLBACK_CACHE:
+        cache.clear()
+
+    token = f"{kind}{seq}"
+    cache[token] = payload
+    context.user_data["callback_seq"] = seq
+    return token
+
+
+def get_callback_payload(context: ContextTypes.DEFAULT_TYPE, token: str) -> Optional[str]:
+    cache = context.user_data.get("callback_payloads", {})
+    payload = cache.get(token)
+    return payload if isinstance(payload, str) else None
 
 
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -236,29 +261,32 @@ async def send_zip(update: Update, chapter_id: str, title: str) -> None:
     await status.delete()
 
 
-def manga_keyboard(slug: str, chapters: List[Dict[str, str]]) -> InlineKeyboardMarkup:
+def manga_keyboard(slug: str, chapters: List[Dict[str, str]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     rows = []
 
     for chapter in chapters[:MAX_CHAPTER_BUTTONS]:
         chapter_id = chapter.get("chapter_id", "")
         name = chapter.get("name", chapter_id)
-        rows.append([InlineKeyboardButton(name, callback_data=f"chapter:{chapter_id}")])
+        token = add_callback_payload(context, "c", chapter_id)
+        rows.append([InlineKeyboardButton(name, callback_data=token)])
 
     if len(chapters) > MAX_CHAPTER_BUTTONS:
         rows.append([InlineKeyboardButton(f"Only showing first {MAX_CHAPTER_BUTTONS} chapters", callback_data="noop")])
 
-    rows.append([InlineKeyboardButton("Download first chapters", callback_data=f"all:{slug}")])
+    all_token = add_callback_payload(context, "a", slug)
+    rows.append([InlineKeyboardButton("Download first chapters", callback_data=all_token)])
     return InlineKeyboardMarkup(rows)
 
 
-def search_keyboard(results: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def search_keyboard(results: List[Dict[str, Any]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     rows = []
     for item in results:
         title = item.get("title") or item.get("slug")
         slug = item.get("slug")
         latest = item.get("latest_chapter", "")
         text = f"{title[:45]} - {latest}" if latest else title[:60]
-        rows.append([InlineKeyboardButton(text, callback_data=f"manga:{slug}")])
+        token = add_callback_payload(context, "m", slug)
+        rows.append([InlineKeyboardButton(text, callback_data=token)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -305,7 +333,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=search_keyboard(results),
+        reply_markup=search_keyboard(results, context),
     )
 
 
@@ -335,7 +363,7 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=search_keyboard(results),
+        reply_markup=search_keyboard(results, context),
     )
 
 
@@ -379,7 +407,7 @@ async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Op
 
     await update.effective_message.reply_text(
         "\n".join(lines),
-        reply_markup=manga_keyboard(slug, chapters),
+        reply_markup=manga_keyboard(slug, chapters, context),
     )
 
 
@@ -464,13 +492,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "noop":
         return
 
-    if data.startswith("manga:"):
-        slug = data.removeprefix("manga:")
+    if data.startswith("m"):
+        slug = get_callback_payload(context, data)
+        if not slug:
+            await query.message.reply_text("This button expired. Please search again.")
+            return
         await manga_cmd(update, context, slug=slug)
         return
 
-    if data.startswith("chapter:"):
-        chapter_id = data.removeprefix("chapter:")
+    if data.startswith("c"):
+        chapter_id = get_callback_payload(context, data)
+        if not chapter_id:
+            await query.message.reply_text("This button expired. Please open the manga again.")
+            return
         ok, title = await safe_to_package(chapter_id)
         if not ok:
             await query.message.reply_text(title)
@@ -478,8 +512,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send_zip(update, chapter_id, title)
         return
 
-    if data.startswith("all:"):
-        slug = data.removeprefix("all:")
+    if data.startswith("a"):
+        slug = get_callback_payload(context, data)
+        if not slug:
+            await query.message.reply_text("This button expired. Please open the manga again.")
+            return
         await all_cmd(update, context, slug=slug)
         return
 
