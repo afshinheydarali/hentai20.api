@@ -32,6 +32,18 @@ BLOCKED_TERMS = {
     "15 years old", "10yo", "11yo", "12yo", "13yo", "14yo", "15yo",
 }
 
+IMAGE_SELECTORS = [
+    "img.image_rin",
+    "img.image_show",
+    "#con img",
+    ".area_image img",
+    ".image_show1 img",
+    ".image_show2 img",
+    "img.img-responsive",
+]
+
+IMAGE_ATTRS = ["src", "data-src", "data-original", "data-lazy-src", "data-url"]
+
 
 @dataclass
 class HentaiKunGallery:
@@ -52,6 +64,10 @@ def _safe_filename(name: str) -> str:
     return name[:140] or "hentaikun"
 
 
+def _clean_url(value: str) -> str:
+    return re.sub(r"\s+", "", value or "").strip()
+
+
 def extract_hentaikun_url(text: str) -> Optional[str]:
     text = (text or "").strip()
     if not text:
@@ -69,6 +85,8 @@ def extract_hentaikun_url(text: str) -> Optional[str]:
     if len(parts) < 3:
         return None
 
+    # Normalize album/chapter/page URLs back to the album URL:
+    # /manga/<category>/<album>/chapter-1/2/ -> /manga/<category>/<album>/
     return f"https://{HK_DOMAIN}/" + "/".join(parts[:3]) + "/"
 
 
@@ -83,7 +101,7 @@ def _get(url: str) -> requests.Response:
 
 
 def _absolute(url: str, base: str) -> str:
-    return urljoin(base, (url or "").strip())
+    return urljoin(base, _clean_url(url))
 
 
 def _album_from_url(url: str) -> str:
@@ -95,7 +113,61 @@ def _title_from_soup(soup: BeautifulSoup, fallback: str) -> str:
     node = soup.select_one("h1") or soup.select_one(".entry-title") or soup.select_one("title")
     title = node.get_text(" ", strip=True) if node else fallback
     title = re.sub(r"\s*-\s*HentaiKun.*$", "", title, flags=re.I).strip()
+    title = re.sub(r"^Chapter\s+\d+\s*-\s*", "", title, flags=re.I).strip()
     return title or fallback
+
+
+def _add_unique(target: List[str], seen: set[str], url: str, base: str) -> None:
+    src = _absolute(url, base)
+    if not src or src in seen:
+        return
+    parsed = urlparse(src)
+    if parsed.scheme not in {"http", "https"}:
+        return
+    seen.add(src)
+    target.append(src)
+
+
+def _extract_page_image_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    urls: List[str] = []
+    seen: set[str] = set()
+
+    for selector in IMAGE_SELECTORS:
+        for img in soup.select(selector):
+            for attr in IMAGE_ATTRS:
+                value = img.get(attr)
+                if value:
+                    _add_unique(urls, seen, value, base_url)
+                    break
+
+    # Current HentaiKun pages also expose upcoming pages inside preloadImages([...]).
+    # Capture those URLs as a useful fallback and to avoid fetching every numbered page when possible.
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text(" ", strip=False) or ""
+        if "preloadImages" not in text and "hendata.com" not in text:
+            continue
+        for match in re.findall(r"https?://[^'\"\s,]+\.(?:jpg|jpeg|png|webp|gif)", text, flags=re.I):
+            _add_unique(urls, seen, match, base_url)
+
+    return urls
+
+
+def _extract_option_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    urls: List[str] = []
+    seen: set[str] = set()
+    for option in soup.select("select option, .form-control option"):
+        value = _clean_url(option.get("value") or "")
+        if value.startswith("http"):
+            _add_unique(urls, seen, value, base_url)
+    return urls
+
+
+def _extract_next_url(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    node = soup.select_one("#pagination .next a[href], .next a[href], a[rel='next'][href]")
+    if not node:
+        return None
+    href = _absolute(node.get("href") or "", base_url)
+    return href or None
 
 
 def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
@@ -111,10 +183,19 @@ def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
     if _blocked(title, album, normalized):
         raise ValueError("Blocked: this gallery appears to involve minors or unsafe terms.")
 
-    chapter_links = []
-    for link in soup.select("a.readchap"):
+    chapter_links: List[str] = []
+    seen_chapters: set[str] = set()
+
+    for link in soup.select("a.readchap[href]"):
         href = _absolute(link.get("href") or "", normalized)
-        if href and href not in chapter_links:
+        if href and href not in seen_chapters:
+            seen_chapters.add(href)
+            chapter_links.append(href)
+
+    # If the album page uses a chapter dropdown instead of a.readchap, support it too.
+    for href in _extract_option_urls(soup, normalized):
+        if "/chapter-" in href and href not in seen_chapters:
+            seen_chapters.add(href)
             chapter_links.append(href)
 
     chapter_links.reverse()
@@ -122,34 +203,47 @@ def get_hentaikun_gallery(url: str) -> HentaiKunGallery:
         chapter_links = [normalized]
 
     image_urls: List[str] = []
-    seen: set[str] = set()
+    seen_images: set[str] = set()
 
     for chapter_url in chapter_links:
         chapter_res = _get(chapter_url)
         chapter_soup = BeautifulSoup(chapter_res.text, "html.parser")
-        page_urls = []
 
-        for option in chapter_soup.select(".form-control option"):
-            value = (option.get("value") or "").strip()
-            if value.startswith("http"):
-                page_urls.append(value)
+        page_urls: List[str] = []
+        seen_pages: set[str] = set()
+        for href in _extract_option_urls(chapter_soup, chapter_url):
+            # Keep only page URLs for this chapter, not links to other chapters.
+            if "/chapter-" not in href:
+                continue
+            if href not in seen_pages:
+                seen_pages.add(href)
+                page_urls.append(href)
 
         if not page_urls:
             page_urls = [chapter_url]
 
+        # Fetch all page URLs from the dropdown. If missing, follow Next links as a fallback.
         for page_url in page_urls:
             page_res = _get(page_url)
             page_soup = BeautifulSoup(page_res.text, "html.parser")
-            for img in page_soup.select("img.image_show"):
-                src = _absolute(img.get("src") or img.get("data-src") or "", page_url)
-                if not src or src in seen:
-                    continue
-                parsed = urlparse(src)
-                if parsed.scheme not in {"http", "https"}:
-                    continue
-                seen.add(src)
-                image_urls.append(src)
+            for image_url in _extract_page_image_urls(page_soup, page_url):
+                _add_unique(image_urls, seen_images, image_url, page_url)
             time.sleep(0.1)
+
+        if len(page_urls) == 1:
+            current_url = page_urls[0]
+            current_soup = chapter_soup
+            for _ in range(80):
+                next_url = _extract_next_url(current_soup, current_url)
+                if not next_url or next_url in seen_pages:
+                    break
+                seen_pages.add(next_url)
+                page_res = _get(next_url)
+                current_soup = BeautifulSoup(page_res.text, "html.parser")
+                for image_url in _extract_page_image_urls(current_soup, next_url):
+                    _add_unique(image_urls, seen_images, image_url, next_url)
+                current_url = next_url
+                time.sleep(0.1)
 
     if not image_urls:
         raise RuntimeError("Could not find HentaiKun images.")
