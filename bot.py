@@ -19,6 +19,14 @@ from telegram.ext import (
 
 from app.resources.errors import CRASH
 from app.routers.hentai20.hentai20 import build_chapter_zip, get_filter_mangas, get_manga
+from app.routers.sarrast.sarrast import (
+    build_sarrast_chapter_zip,
+    build_sarrast_chapters_from_chapter_api,
+    is_sarrast_chapter_url,
+    is_sarrast_series_url,
+    load_sarrast_chapters,
+    normalize_sarrast_url,
+)
 
 load_dotenv()
 
@@ -82,11 +90,6 @@ def blocked_text(*values: str) -> bool:
 
 
 def add_callback_payload(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: str) -> str:
-    """Store long callback payloads server-side and return a short Telegram-safe key.
-
-    Telegram limits InlineKeyboardButton.callback_data to 64 bytes. Long manga slugs or
-    chapter IDs can exceed that, so buttons only carry short keys like m12/c13/a14.
-    """
     cache = context.user_data.setdefault("callback_payloads", {})
     seq = int(context.user_data.get("callback_seq", 0)) + 1
 
@@ -261,6 +264,37 @@ async def send_zip(update: Update, chapter_id: str, title: str) -> None:
     await status.delete()
 
 
+async def send_sarrast_zip(update: Update, chapter_url: str) -> None:
+    message = update.effective_message
+    chapter_url = normalize_sarrast_url(chapter_url)
+    status = await message.reply_text(f"Building Sarrast ZIP...\n{chapter_url}")
+
+    result = build_sarrast_chapter_zip(chapter_url)
+
+    if result == CRASH or type(result) is int:
+        await status.edit_text("Could not build Sarrast chapter ZIP.")
+        return
+
+    filename, archive_bytes, title = result
+
+    if len(archive_bytes) > MAX_TELEGRAM_FILE_BYTES:
+        await status.edit_text(
+            f"Sarrast ZIP is too large for Telegram: {len(archive_bytes) / 1024 / 1024:.1f} MB"
+        )
+        return
+
+    bio = io.BytesIO(archive_bytes)
+    bio.name = filename
+
+    await message.reply_document(
+        document=bio,
+        filename=filename,
+        caption=f"{title}\n{chapter_url}",
+    )
+
+    await status.delete()
+
+
 def manga_keyboard(slug: str, chapters: List[Dict[str, str]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     rows = []
 
@@ -275,6 +309,23 @@ def manga_keyboard(slug: str, chapters: List[Dict[str, str]], context: ContextTy
 
     all_token = add_callback_payload(context, "a", slug)
     rows.append([InlineKeyboardButton("Download first chapters", callback_data=all_token)])
+    return InlineKeyboardMarkup(rows)
+
+
+def sarrast_keyboard(chapters: List[Dict[str, Any]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    rows = []
+
+    for chapter in chapters[:MAX_CHAPTER_BUTTONS]:
+        number = chapter.get("number", "")
+        title = chapter.get("title") or f"قسمت {number}"
+        chapter_url = chapter.get("url", "")
+        text = f"#{number} - {title}" if number else str(title)
+        token = add_callback_payload(context, "s", chapter_url)
+        rows.append([InlineKeyboardButton(text[:60], callback_data=token)])
+
+    if len(chapters) > MAX_CHAPTER_BUTTONS:
+        rows.append([InlineKeyboardButton(f"Only showing first {MAX_CHAPTER_BUTTONS} chapters", callback_data="noop")])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -302,6 +353,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/manga manga-slug\n"
         "/chapter chapter-id\n"
         "/all manga-slug\n\n"
+        "Sarrast:\n"
+        "Send a Sarrast series link to choose chapters with buttons.\n"
+        "Send a Sarrast chapter link to download directly.\n\n"
         "Example:\n"
         "/search university\n"
         "/manga 69-university\n"
@@ -411,12 +465,36 @@ async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Op
     )
 
 
+async def sarrast_series(update: Update, context: ContextTypes.DEFAULT_TYPE, series_url: str) -> None:
+    if not allowed(update):
+        await update.effective_message.reply_text("Access denied.")
+        return
+
+    series_url = normalize_sarrast_url(series_url)
+    status = await update.effective_message.reply_text("Loading Sarrast chapters...")
+    chapters = load_sarrast_chapters(series_url)
+
+    if chapters == CRASH or type(chapters) is int or not chapters:
+        await status.edit_text("Could not load Sarrast chapters.")
+        return
+
+    await status.edit_text(
+        f"Sarrast chapters: {len(chapters)}\nSelect a chapter:",
+        reply_markup=sarrast_keyboard(chapters, context),
+    )
+
+
 async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         await update.message.reply_text("Access denied.")
         return
 
-    chapter_id = extract_chapter_id(" ".join(context.args))
+    arg_text = " ".join(context.args).strip()
+    if arg_text and is_sarrast_chapter_url(arg_text):
+        await send_sarrast_zip(update, arg_text)
+        return
+
+    chapter_id = extract_chapter_id(arg_text)
 
     if not chapter_id:
         await update.message.reply_text("Usage: /chapter 69-university-chapter-35/")
@@ -520,9 +598,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await all_cmd(update, context, slug=slug)
         return
 
+    if data.startswith("s"):
+        chapter_url = get_callback_payload(context, data)
+        if not chapter_url:
+            await query.message.reply_text("This button expired. Please send the Sarrast series again.")
+            return
+        await send_sarrast_zip(update, chapter_url)
+        return
+
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text if update.message else ""
+    stripped = text.strip()
+
+    if is_sarrast_series_url(stripped):
+        await sarrast_series(update, context, stripped)
+        return
+
+    if is_sarrast_chapter_url(stripped):
+        await send_sarrast_zip(update, stripped)
+        return
 
     chapter_id = extract_chapter_id(text)
     if chapter_id:
