@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build as google_build
 from googleapiclient.http import MediaIoBaseUpload
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -52,13 +54,22 @@ MAX_CHAPTERS_PER_ALL = int(os.getenv("MAX_CHAPTERS_PER_ALL", "10") or "10")
 MAX_CHAPTER_BUTTONS = int(os.getenv("MAX_CHAPTER_BUTTONS", "80") or "80")
 MAX_CALLBACK_CACHE = int(os.getenv("MAX_CALLBACK_CACHE", "500") or "500")
 
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_OAUTH_TOKEN_JSON = os.getenv("GOOGLE_OAUTH_TOKEN_JSON", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = (
+    os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    or os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+)
 GOOGLE_DRIVE_CREDENTIALS_FILE = (
     os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "").strip()
     or os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
     or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 )
-GOOGLE_DRIVE_PUBLIC = os.getenv("GOOGLE_DRIVE_PUBLIC", "1").strip().lower() not in {"0", "false", "no", "off"}
+GOOGLE_DRIVE_PUBLIC = (
+    os.getenv("GOOGLE_DRIVE_PUBLIC", os.getenv("GDRIVE_MAKE_PUBLIC", "1"))
+    .strip()
+    .lower()
+    not in {"0", "false", "no", "off"}
+)
 
 BASE_URL = "https://hentai20.io"
 
@@ -270,12 +281,22 @@ async def search_mangas(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[D
 
 @lru_cache(maxsize=1)
 def get_drive_service():
+    scopes = ["https://www.googleapis.com/auth/drive"]
+
+    if GOOGLE_OAUTH_TOKEN_JSON:
+        token_info = json.loads(GOOGLE_OAUTH_TOKEN_JSON)
+        credentials = OAuthCredentials.from_authorized_user_info(token_info, scopes=scopes)
+
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(GoogleAuthRequest())
+
+        return google_build("drive", "v3", credentials=credentials, cache_discovery=False)
+
     if not GOOGLE_DRIVE_CREDENTIALS_FILE:
         raise RuntimeError(
-            "Google Drive credentials are missing. Set GOOGLE_DRIVE_CREDENTIALS_FILE or GOOGLE_SERVICE_ACCOUNT_FILE."
+            "Google Drive credentials are missing. Set GOOGLE_OAUTH_TOKEN_JSON or GOOGLE_DRIVE_CREDENTIALS_FILE."
         )
 
-    scopes = ["https://www.googleapis.com/auth/drive.file"]
     credentials = service_account.Credentials.from_service_account_file(
         GOOGLE_DRIVE_CREDENTIALS_FILE,
         scopes=scopes,

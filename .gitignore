@@ -9,3 +9,10 @@ scripts
 **/__pycache__/
 *.pyc
 *.py[cod]
+# secrets / local env
+.env
+*.env
+sarrast-cookies.txt
+credentials.json
+*credentials*.json
+client_secret*.json
