@@ -1,12 +1,17 @@
 import io
+import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as google_build
+from googleapiclient.http import MediaIoBaseUpload
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -46,6 +51,14 @@ DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "10") or "10")
 MAX_CHAPTERS_PER_ALL = int(os.getenv("MAX_CHAPTERS_PER_ALL", "10") or "10")
 MAX_CHAPTER_BUTTONS = int(os.getenv("MAX_CHAPTER_BUTTONS", "80") or "80")
 MAX_CALLBACK_CACHE = int(os.getenv("MAX_CALLBACK_CACHE", "500") or "500")
+
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_DRIVE_CREDENTIALS_FILE = (
+    os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "").strip()
+    or os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+)
+GOOGLE_DRIVE_PUBLIC = os.getenv("GOOGLE_DRIVE_PUBLIC", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 BASE_URL = "https://hentai20.io"
 
@@ -106,6 +119,32 @@ def get_callback_payload(context: ContextTypes.DEFAULT_TYPE, token: str) -> Opti
     cache = context.user_data.get("callback_payloads", {})
     payload = cache.get(token)
     return payload if isinstance(payload, str) else None
+
+
+def upload_choice_keyboard(context: ContextTypes.DEFAULT_TYPE, source: str, payload: str) -> InlineKeyboardMarkup:
+    token_payload = json.dumps({"source": source, "payload": payload}, ensure_ascii=False)
+    token = add_callback_payload(context, "u", token_payload)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("ارسال در تلگرام", callback_data=f"tg:{token}"),
+                InlineKeyboardButton("آپلود در Google Drive", callback_data=f"gd:{token}"),
+            ]
+        ]
+    )
+
+
+async def ask_upload_destination(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source: str,
+    payload: str,
+    title: str,
+) -> None:
+    await update.effective_message.reply_text(
+        f"کجا آپلود کنم؟\n{title}",
+        reply_markup=upload_choice_keyboard(context, source, payload),
+    )
 
 
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -229,6 +268,132 @@ async def search_mangas(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[D
     return results
 
 
+@lru_cache(maxsize=1)
+def get_drive_service():
+    if not GOOGLE_DRIVE_CREDENTIALS_FILE:
+        raise RuntimeError(
+            "Google Drive credentials are missing. Set GOOGLE_DRIVE_CREDENTIALS_FILE or GOOGLE_SERVICE_ACCOUNT_FILE."
+        )
+
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    credentials = service_account.Credentials.from_service_account_file(
+        GOOGLE_DRIVE_CREDENTIALS_FILE,
+        scopes=scopes,
+    )
+    return google_build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def upload_bytes_to_drive(filename: str, data: bytes, description: str = "") -> str:
+    service = get_drive_service()
+
+    metadata: Dict[str, Any] = {
+        "name": filename,
+        "description": description,
+    }
+    if GOOGLE_DRIVE_FOLDER_ID:
+        metadata["parents"] = [GOOGLE_DRIVE_FOLDER_ID]
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype="application/zip",
+        resumable=False,
+    )
+
+    created = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,webViewLink,webContentLink",
+    ).execute()
+
+    file_id = created["id"]
+
+    if GOOGLE_DRIVE_PUBLIC:
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            fields="id",
+        ).execute()
+        created = service.files().get(
+            fileId=file_id,
+            fields="id,name,webViewLink,webContentLink",
+        ).execute()
+
+    return created.get("webViewLink") or created.get("webContentLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+
+async def build_package(source: str, payload: str) -> Optional[Tuple[str, bytes, str, str]]:
+    if source == "h":
+        ok, title = await safe_to_package(payload)
+        if not ok:
+            raise RuntimeError(title)
+
+        result = await build_chapter_zip(payload)
+        if result == CRASH or type(result) is int:
+            return None
+
+        filename, archive_bytes = result
+        return filename, archive_bytes, title, payload
+
+    if source == "s":
+        chapter_url = normalize_sarrast_url(payload)
+        result = build_sarrast_chapter_zip(chapter_url)
+        if result == CRASH or type(result) is int:
+            return None
+
+        filename, archive_bytes, title = result
+        return filename, archive_bytes, title, chapter_url
+
+    raise RuntimeError("Unknown upload source")
+
+
+async def upload_package(update: Update, context: ContextTypes.DEFAULT_TYPE, source: str, payload: str, destination: str) -> None:
+    message = update.effective_message
+    status = await message.reply_text("در حال ساخت ZIP...")
+
+    try:
+        package = await build_package(source, payload)
+    except Exception as exc:
+        await status.edit_text(str(exc))
+        return
+
+    if not package:
+        await status.edit_text("Could not build ZIP.")
+        return
+
+    filename, archive_bytes, title, label = package
+
+    if destination == "telegram":
+        if len(archive_bytes) > MAX_TELEGRAM_FILE_BYTES:
+            if PUBLIC_BASE_URL and source == "h":
+                await status.edit_text(f"ZIP is too large for Telegram.\nDownload:\n{PUBLIC_BASE_URL}/hentai/download/{label}")
+            else:
+                await status.edit_text(f"ZIP is too large for Telegram: {len(archive_bytes) / 1024 / 1024:.1f} MB")
+            return
+
+        bio = io.BytesIO(archive_bytes)
+        bio.name = filename
+        await message.reply_document(
+            document=bio,
+            filename=filename,
+            caption=f"{title}\n{label}",
+        )
+        await status.delete()
+        return
+
+    if destination == "drive":
+        await status.edit_text("در حال آپلود در Google Drive...")
+        try:
+            link = upload_bytes_to_drive(filename, archive_bytes, description=f"{title}\n{label}")
+        except Exception as exc:
+            await status.edit_text(f"Google Drive upload failed:\n{exc}")
+            return
+
+        await status.edit_text(f"✅ آپلود شد در Google Drive:\n{link}")
+        return
+
+    await status.edit_text("Unknown upload destination.")
+
+
 async def send_zip(update: Update, chapter_id: str, title: str) -> None:
     message = update.effective_message
     status = await message.reply_text(f"Building ZIP for {chapter_id} ...")
@@ -265,34 +430,7 @@ async def send_zip(update: Update, chapter_id: str, title: str) -> None:
 
 
 async def send_sarrast_zip(update: Update, chapter_url: str) -> None:
-    message = update.effective_message
-    chapter_url = normalize_sarrast_url(chapter_url)
-    status = await message.reply_text(f"Building Sarrast ZIP...\n{chapter_url}")
-
-    result = build_sarrast_chapter_zip(chapter_url)
-
-    if result == CRASH or type(result) is int:
-        await status.edit_text("Could not build Sarrast chapter ZIP.")
-        return
-
-    filename, archive_bytes, title = result
-
-    if len(archive_bytes) > MAX_TELEGRAM_FILE_BYTES:
-        await status.edit_text(
-            f"Sarrast ZIP is too large for Telegram: {len(archive_bytes) / 1024 / 1024:.1f} MB"
-        )
-        return
-
-    bio = io.BytesIO(archive_bytes)
-    bio.name = filename
-
-    await message.reply_document(
-        document=bio,
-        filename=filename,
-        caption=f"{title}\n{chapter_url}",
-    )
-
-    await status.delete()
+    await upload_package(update, None, "s", chapter_url, "telegram")
 
 
 def manga_keyboard(slug: str, chapters: List[Dict[str, str]], context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
@@ -353,9 +491,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/manga manga-slug\n"
         "/chapter chapter-id\n"
         "/all manga-slug\n\n"
+        "Upload options:\n"
+        "After choosing a chapter, select Telegram or Google Drive.\n\n"
         "Sarrast:\n"
         "Send a Sarrast series link to choose chapters with buttons.\n"
-        "Send a Sarrast chapter link to download directly.\n\n"
+        "Send a Sarrast chapter link to choose upload destination.\n\n"
         "Example:\n"
         "/search university\n"
         "/manga 69-university\n"
@@ -491,7 +631,7 @@ async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     arg_text = " ".join(context.args).strip()
     if arg_text and is_sarrast_chapter_url(arg_text):
-        await send_sarrast_zip(update, arg_text)
+        await ask_upload_destination(update, context, "s", normalize_sarrast_url(arg_text), arg_text)
         return
 
     chapter_id = extract_chapter_id(arg_text)
@@ -506,7 +646,7 @@ async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(title)
         return
 
-    await send_zip(update, chapter_id, title)
+    await ask_upload_destination(update, context, "h", chapter_id, title)
 
 
 async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Optional[str] = None) -> None:
@@ -545,7 +685,7 @@ async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: Opti
         return
 
     await update.effective_message.reply_text(
-        f"Downloading {len(chapters)} chapters. Limit: {MAX_CHAPTERS_PER_ALL}"
+        f"Downloading {len(chapters)} chapters to Telegram. Limit: {MAX_CHAPTERS_PER_ALL}"
     )
 
     for chapter in chapters:
@@ -570,6 +710,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "noop":
         return
 
+    if data.startswith("tg:") or data.startswith("gd:"):
+        destination = "telegram" if data.startswith("tg:") else "drive"
+        token = data.split(":", 1)[1]
+        raw_payload = get_callback_payload(context, token)
+        if not raw_payload:
+            await query.message.reply_text("This upload button expired. Please choose the chapter again.")
+            return
+        try:
+            obj = json.loads(raw_payload)
+            source = obj["source"]
+            payload = obj["payload"]
+        except Exception:
+            await query.message.reply_text("Invalid upload payload. Please choose the chapter again.")
+            return
+        await upload_package(update, context, source, payload, destination)
+        return
+
     if data.startswith("m"):
         slug = get_callback_payload(context, data)
         if not slug:
@@ -587,7 +744,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not ok:
             await query.message.reply_text(title)
             return
-        await send_zip(update, chapter_id, title)
+        await ask_upload_destination(update, context, "h", chapter_id, title)
         return
 
     if data.startswith("a"):
@@ -603,7 +760,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not chapter_url:
             await query.message.reply_text("This button expired. Please send the Sarrast series again.")
             return
-        await send_sarrast_zip(update, chapter_url)
+        await ask_upload_destination(update, context, "s", chapter_url, chapter_url)
         return
 
 
@@ -616,7 +773,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if is_sarrast_chapter_url(stripped):
-        await send_sarrast_zip(update, stripped)
+        await ask_upload_destination(update, context, "s", normalize_sarrast_url(stripped), stripped)
         return
 
     chapter_id = extract_chapter_id(text)
@@ -625,7 +782,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not ok:
             await update.message.reply_text(title)
             return
-        await send_zip(update, chapter_id, title)
+        await ask_upload_destination(update, context, "h", chapter_id, title)
         return
 
     await search_cmd(update, context)
