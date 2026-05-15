@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import arabic_reshaper
-import requests
+from curl_cffi import requests
 from bidi.algorithm import get_display
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
@@ -25,6 +25,9 @@ SARRAST_MAX_IMAGE_BYTES = int(os.getenv("SARRAST_MAX_IMAGE_MB", "50") or "50") *
 SARRAST_MAX_ARCHIVE_BYTES = int(os.getenv("SARRAST_MAX_ARCHIVE_MB", "450") or "450") * 1024 * 1024
 SARRAST_PROXY_URL = os.getenv("SARRAST_PROXY_URL", "").strip()
 SARRAST_FONT_PATH = os.getenv("SARRAST_FONT_PATH", "").strip()
+SARRAST_COOKIE_FILE = os.getenv("SARRAST_COOKIE_FILE", "").strip()
+SARRAST_COOKIE = os.getenv("SARRAST_COOKIE", "").strip()
+SARRAST_IMPERSONATE = os.getenv("SARRAST_IMPERSONATE", "chrome124").strip() or "chrome124"
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -45,6 +48,36 @@ def sarrast_proxies() -> Optional[Dict[str, str]]:
     if not SARRAST_PROXY_URL:
         return None
     return {"http": SARRAST_PROXY_URL, "https": SARRAST_PROXY_URL}
+
+
+@lru_cache(maxsize=1)
+def sarrast_cookies() -> Dict[str, str]:
+    cookies: Dict[str, str] = {}
+
+    if SARRAST_COOKIE:
+        for part in SARRAST_COOKIE.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if name:
+                cookies[name] = value
+
+    if SARRAST_COOKIE_FILE and Path(SARRAST_COOKIE_FILE).exists():
+        with open(SARRAST_COOKIE_FILE, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    name = parts[5].strip()
+                    value = parts[6].strip()
+                    if name:
+                        cookies[name] = value
+
+    return cookies
 
 
 def normalize_sarrast_url(url: str) -> str:
@@ -125,11 +158,26 @@ def safe_archive_name(value: str) -> str:
     return value[:140]
 
 
-def sarrast_get(url: str, referer: Optional[str] = None, timeout: Tuple[int, int] = SARRAST_TIMEOUT) -> requests.Response:
+def timeout_value(timeout: Tuple[int, int]) -> int:
+    try:
+        return int(timeout[1])
+    except Exception:
+        return 60
+
+
+def sarrast_get(url: str, referer: Optional[str] = None, timeout: Tuple[int, int] = SARRAST_TIMEOUT):
     headers = dict(HEADERS_BASE)
     if referer:
         headers["Referer"] = referer
-    response = requests.get(url, headers=headers, proxies=sarrast_proxies(), timeout=timeout)
+
+    response = requests.get(
+        url,
+        headers=headers,
+        cookies=sarrast_cookies() or None,
+        proxies=sarrast_proxies(),
+        timeout=timeout_value(timeout),
+        impersonate=SARRAST_IMPERSONATE,
+    )
     response.raise_for_status()
     return response
 
