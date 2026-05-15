@@ -16,3 +16,9 @@ sarrast-cookies.txt
 credentials.json
 *credentials*.json
 client_secret*.json
+
+.venv/
+Mikhak-Medium1.woff2
+*.bak
+*.zip
+make_gdrive_token.py
