@@ -13,7 +13,7 @@ import arabic_reshaper
 from curl_cffi import requests
 from bidi.algorithm import get_display
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 from app.resources.errors import CRASH
 
@@ -28,8 +28,11 @@ SARRAST_FONT_PATH = os.getenv("SARRAST_FONT_PATH", "").strip()
 SARRAST_COOKIE_FILE = os.getenv("SARRAST_COOKIE_FILE", "").strip()
 SARRAST_COOKIE = os.getenv("SARRAST_COOKIE", "").strip()
 SARRAST_IMPERSONATE = os.getenv("SARRAST_IMPERSONATE", "chrome124").strip() or "chrome124"
+SARRAST_LOG_FONT = os.getenv("SARRAST_LOG_FONT", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 Image.MAX_IMAGE_PIXELS = None
+USE_RAQM = features.check("raqm")
+_FONT_PRINTED = False
 
 HEADERS_BASE = {
     "User-Agent": (
@@ -293,11 +296,42 @@ def clean_html_text(value: str) -> str:
 
 
 def rtl_text(text: str) -> str:
+    if USE_RAQM:
+        return text
     return get_display(arabic_reshaper.reshape(text))
+
+
+def text_bbox(draw: ImageDraw.ImageDraw, xy, text: str, font):
+    if USE_RAQM:
+        return draw.textbbox(
+            xy,
+            text,
+            font=font,
+            direction="rtl",
+            language="fa",
+        )
+    shaped = rtl_text(text)
+    return draw.textbbox(xy, shaped, font=font)
+
+
+def draw_rtl_text(draw: ImageDraw.ImageDraw, xy, text: str, font, fill) -> None:
+    if USE_RAQM:
+        draw.text(
+            xy,
+            text,
+            fill=fill,
+            font=font,
+            direction="rtl",
+            language="fa",
+        )
+        return
+    draw.text(xy, rtl_text(text), fill=fill, font=font)
 
 
 @lru_cache(maxsize=256)
 def find_font(size: int) -> ImageFont.FreeTypeFont:
+    global _FONT_PRINTED
+
     candidates = [
         SARRAST_FONT_PATH,
         "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
@@ -308,9 +342,24 @@ def find_font(size: int) -> ImageFont.FreeTypeFont:
     for path in candidates:
         if path and Path(path).exists():
             try:
-                return ImageFont.truetype(path, size=size)
-            except Exception:
+                font = ImageFont.truetype(path, size=size)
+                if SARRAST_LOG_FONT and not _FONT_PRINTED:
+                    print(f"[SARRAST FONT] using: {path}", flush=True)
+                    print(f"[SARRAST FONT] size sample: {size}", flush=True)
+                    print(f"[SARRAST FONT] raqm: {USE_RAQM}", flush=True)
+                    try:
+                        print(f"[SARRAST FONT] family: {font.getname()}", flush=True)
+                    except Exception as exc:
+                        print(f"[SARRAST FONT] getname failed: {exc}", flush=True)
+                    _FONT_PRINTED = True
+                return font
+            except Exception as exc:
+                if SARRAST_LOG_FONT and not _FONT_PRINTED:
+                    print(f"[SARRAST FONT] failed: {path} | {exc}", flush=True)
                 continue
+    if SARRAST_LOG_FONT and not _FONT_PRINTED:
+        print("[SARRAST FONT] using Pillow default font", flush=True)
+        _FONT_PRINTED = True
     return ImageFont.load_default()
 
 
@@ -388,8 +437,7 @@ def shrink_font_to_fit(draw: ImageDraw.ImageDraw, lines: List[str], box_w: int, 
         total_h = 0
         max_w = 0
         for line in lines:
-            shaped = rtl_text(line)
-            bbox = draw.textbbox((0, 0), shaped, font=font)
+            bbox = text_bbox(draw, (0, 0), line, font)
             max_w = max(max_w, bbox[2] - bbox[0])
             total_h += bbox[3] - bbox[1]
         total_h += spacing * max(0, len(lines) - 1)
@@ -411,16 +459,21 @@ def render_text_on_box(box_img: Image.Image, content: str, bg: str, box_w: int, 
     line_render_data = []
     total_text_h = 0
     for line in lines:
-        shaped = rtl_text(line)
-        bbox = draw.textbbox((0, 0), shaped, font=font)
+        bbox = text_bbox(draw, (0, 0), line, font)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        line_render_data.append((shaped, w, h))
+        line_render_data.append((line, w, h))
         total_text_h += h
     total_text_h += spacing * max(0, len(lines) - 1)
     current_y = int((box_h - total_text_h) / 2)
-    for shaped, w, h in line_render_data:
-        draw.text((int((box_w - w) / 2), current_y), shaped, fill=text_fill, font=font)
+    for line, w, h in line_render_data:
+        draw_rtl_text(
+            draw=draw,
+            xy=(int((box_w - w) / 2), current_y),
+            text=line,
+            font=font,
+            fill=text_fill,
+        )
         current_y += h + spacing
 
 
