@@ -332,35 +332,32 @@ def draw_rtl_text(draw: ImageDraw.ImageDraw, xy, text: str, font, fill) -> None:
 def find_font(size: int) -> ImageFont.FreeTypeFont:
     global _FONT_PRINTED
 
-    candidates = [
-        SARRAST_FONT_PATH,
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for path in candidates:
-        if path and Path(path).exists():
-            try:
-                font = ImageFont.truetype(path, size=size)
-                if SARRAST_LOG_FONT and not _FONT_PRINTED:
-                    print(f"[SARRAST FONT] using: {path}", flush=True)
-                    print(f"[SARRAST FONT] size sample: {size}", flush=True)
-                    print(f"[SARRAST FONT] raqm: {USE_RAQM}", flush=True)
-                    try:
-                        print(f"[SARRAST FONT] family: {font.getname()}", flush=True)
-                    except Exception as exc:
-                        print(f"[SARRAST FONT] getname failed: {exc}", flush=True)
-                    _FONT_PRINTED = True
-                return font
-            except Exception as exc:
-                if SARRAST_LOG_FONT and not _FONT_PRINTED:
-                    print(f"[SARRAST FONT] failed: {path} | {exc}", flush=True)
-                continue
-    if SARRAST_LOG_FONT and not _FONT_PRINTED:
-        print("[SARRAST FONT] using Pillow default font", flush=True)
+    font_path = str(SARRAST_FONT_PATH or "").strip()
+
+    if not font_path:
+        raise RuntimeError("SARRAST_FONT_PATH is empty. Set it in .env")
+
+    if not Path(font_path).exists():
+        raise RuntimeError(f"SARRAST_FONT_PATH not found: {font_path}")
+
+    font = ImageFont.truetype(
+        font_path,
+        size=size,
+        layout_engine=ImageFont.Layout.RAQM if USE_RAQM else ImageFont.Layout.BASIC,
+    )
+
+    if not _FONT_PRINTED:
+        print(f"[SARRAST FONT] using: {font_path}", flush=True)
+        print(f"[SARRAST FONT] size sample: {size}", flush=True)
+        print(f"[SARRAST FONT] raqm: {USE_RAQM}", flush=True)
+        try:
+            print(f"[SARRAST FONT] family: {font.getname()}", flush=True)
+        except Exception:
+            pass
         _FONT_PRINTED = True
-    return ImageFont.load_default()
+
+    return font
+
 
 
 def get_text_color(bg: str) -> str:
