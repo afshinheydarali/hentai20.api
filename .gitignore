@@ -22,3 +22,22 @@ Mikhak-Medium1.woff2
 *.bak
 *.zip
 make_gdrive_token.py
+
+# local secrets / tokens
+.env
+*.env
+sarrast-cookies.txt
+.nixfile-token.json
+credentials.json
+*credentials*.json
+client_secret*.json
+
+# local runtime files
+tmp_uploads/
+debug/
+*.zip
+*.bak
+.venv/
+Mikhak-Medium1.woff2
+make_gdrive_token.py
+make_gdrive_token_windows.py

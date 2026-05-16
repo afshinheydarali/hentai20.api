@@ -2,13 +2,17 @@ import io
 import json
 import os
 import re
+import tempfile
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+load_dotenv('/root/project/hentai20.api/.env')
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -25,6 +29,7 @@ from telegram.ext import (
 )
 
 from app.resources.errors import CRASH
+from app.uploaders.nixfile_auto import upload_file as upload_to_nixfile
 from app.routers.hentai20.hentai20 import build_chapter_zip, get_filter_mangas, get_manga
 from app.routers.sarrast.sarrast import (
     build_sarrast_chapter_zip,
@@ -35,7 +40,6 @@ from app.routers.sarrast.sarrast import (
     normalize_sarrast_url,
 )
 
-load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_USER_IDS = {
@@ -70,6 +74,11 @@ GOOGLE_DRIVE_PUBLIC = (
     .lower()
     not in {"0", "false", "no", "off"}
 )
+
+NIXFILE_USERNAME = os.getenv("NIXFILE_USERNAME", "").strip()
+NIXFILE_PASS = os.getenv("NIXFILE_PASS", "").strip()
+NIXFILE_HEADLESS = os.getenv("NIXFILE_HEADLESS", "1").strip().lower() not in {"0", "false", "no", "off"}
+NIXFILE_TIMEOUT = int(os.getenv("NIXFILE_TIMEOUT", "600") or "600")
 
 BASE_URL = "https://hentai20.io"
 
@@ -140,6 +149,9 @@ def upload_choice_keyboard(context: ContextTypes.DEFAULT_TYPE, source: str, payl
             [
                 InlineKeyboardButton("ارسال در تلگرام", callback_data=f"tg:{token}"),
                 InlineKeyboardButton("آپلود در Google Drive", callback_data=f"gd:{token}"),
+            ],
+            [
+                InlineKeyboardButton("آپلود در NixFile", callback_data=f"nx:{token}"),
             ]
         ]
     )
@@ -410,6 +422,42 @@ async def upload_package(update: Update, context: ContextTypes.DEFAULT_TYPE, sou
             return
 
         await status.edit_text(f"✅ آپلود شد در Google Drive:\n{link}")
+        return
+
+    if destination == "nixfile":
+        if not NIXFILE_USERNAME or not NIXFILE_PASS:
+            await status.edit_text("NixFile credentials are missing. Set NIXFILE_USERNAME and NIXFILE_PASS in .env")
+            return
+
+        await status.edit_text("در حال آپلود در NixFile...")
+
+        tmp_path = None
+        try:
+            upload_tmp_dir = Path("tmp_uploads")
+            upload_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False, dir=upload_tmp_dir) as tmp:
+                tmp.write(archive_bytes)
+                tmp_path = Path(tmp.name)
+
+            link = upload_to_nixfile(
+                file_path=tmp_path,
+                username=NIXFILE_USERNAME,
+                password=NIXFILE_PASS,
+                headless=NIXFILE_HEADLESS,
+                timeout=NIXFILE_TIMEOUT,
+            )
+        except Exception as exc:
+            await status.edit_text(f"NixFile upload failed:\n{exc}")
+            return
+        finally:
+            if tmp_path:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        await status.edit_text(f"✅ آپلود شد در NixFile:\n{link}")
         return
 
     await status.edit_text("Unknown upload destination.")
@@ -731,8 +779,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "noop":
         return
 
-    if data.startswith("tg:") or data.startswith("gd:"):
-        destination = "telegram" if data.startswith("tg:") else "drive"
+    if data.startswith("tg:") or data.startswith("gd:") or data.startswith("nx:"):
+        if data.startswith("tg:"):
+            destination = "telegram"
+        elif data.startswith("gd:"):
+            destination = "drive"
+        else:
+            destination = "nixfile"
         token = data.split(":", 1)[1]
         raw_payload = get_callback_payload(context, token)
         if not raw_payload:
