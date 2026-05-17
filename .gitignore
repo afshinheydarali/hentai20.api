@@ -32,6 +32,13 @@ credentials.json
 *credentials*.json
 client_secret*.json
 
+# Rubika local session files
+rubika_session*
+*.rp
+*.session
+*.sqlite
+*.sqlite3
+
 # local runtime files
 tmp_uploads/
 debug/
