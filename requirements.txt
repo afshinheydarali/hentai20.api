@@ -27,3 +27,4 @@ arabic-reshaper==3.0.0
 python-bidi==0.6.0
 PySocks==1.7.1
 curl_cffi==0.7.4
+rubpy==7.0.1
